@@ -166,6 +166,7 @@ def test_background_transcription_raw_xai_success(monkeypatch):
         assert url == "https://api.x.ai/v1/stt"
         assert headers == {"Authorization": "Bearer xai-test-key"}
         assert data["sample_rate"] == "16000"
+        assert data["language"] == "en"
         assert files["file"][0] == "segment.wav"
         assert files["file"][2] == "audio/wav"
         return DummyResponse()
@@ -181,6 +182,41 @@ def test_background_transcription_raw_xai_success(monkeypatch):
     body = response.json()
     assert body["provider"] == "xai"
     assert body["text"] == "raw hello world"
+
+
+def test_background_transcription_xai_defaults_language_when_formatting_enabled(monkeypatch):
+    class DummyResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "text": "hello world",
+                "duration": 1.23,
+                "language": "en",
+                "words": [],
+                "channels": [],
+            }
+
+    async def fake_post(self, url, headers=None, data=None, files=None):
+        assert url == "https://api.x.ai/v1/stt"
+        assert headers == {"Authorization": "Bearer xai-test-key"}
+        assert data["format"] == "true"
+        assert data["language"] == "en"
+        assert files["file"][0] == "sample.wav"
+        return DummyResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient.post", fake_post)
+
+    response = client.post(
+        "/v1/background/transcriptions",
+        headers={"x-agent-key": "test-key"},
+        files={"file": ("sample.wav", b"RIFF", "audio/wav")},
+        data={"provider": "xai", "diarize": "true"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider"] == "xai"
+    assert body["text"] == "hello world"
 
 
 def test_background_transcription_raw_requires_body():

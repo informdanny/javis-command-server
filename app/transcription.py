@@ -67,9 +67,14 @@ async def transcribe_bytes_with_xai(
             detail="xai stt is not configured",
         )
 
+    resolved_language = language
+    if apply_formatting and not resolved_language:
+        # xAI currently requires `language` whenever `format=true`.
+        resolved_language = "en"
+
     data: dict[str, str] = {"format": _bool_value(apply_formatting), "diarize": _bool_value(diarize)}
-    if language:
-        data["language"] = language
+    if resolved_language:
+        data["language"] = resolved_language
     if multichannel:
         data["multichannel"] = "true"
     if channels is not None:

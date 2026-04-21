@@ -96,6 +96,8 @@ curl -sS http://127.0.0.1:8000/v1/background/transcriptions \
   -F "file=@sample.wav;type=audio/wav"
 ```
 
+If you omit `language`, the server currently defaults formatted xAI transcripts to `en` because xAI requires `language` when `format=true`.
+
 Upload a raw WAV body the way the ESP32 firmware does:
 
 ```bash
@@ -122,3 +124,4 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
 - The realtime WebSocket relay is server-to-server and is intended to sit behind the ESP32 client or a local bridge.
 - Background transcription currently supports only `xai` in the implemented API.
 - `POST /v1/background/transcriptions/raw` exists specifically to keep the ESP32 upload path simple by accepting a raw audio body instead of multipart form data.
+- When `apply_formatting=true` and no `language` is supplied, the server currently falls back to `en` for xAI STT compatibility.
