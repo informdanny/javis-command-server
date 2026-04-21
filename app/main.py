@@ -1,22 +1,47 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
 import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Request
+import websockets
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from websockets.exceptions import ConnectionClosed
 
-from app.auth import require_agent_key
+from app.auth import require_agent_key, validate_agent_key_value
 from app.config import get_settings
 from app.handlers import build_status_reply
+from app.providers import (
+    build_interoperable_tools,
+    build_provider_catalog,
+    build_realtime_headers,
+    build_realtime_upstream_url,
+    build_session_update_event,
+    resolve_voice_provider,
+)
+from app.realtime_tools import build_function_output_event, execute_realtime_tool_call, extract_realtime_tool_calls
 from app.router import route_command
-from app.schemas import CommandAction, CommandRequest, CommandResponse, Intent, Status
+from app.schemas import (
+    BackgroundTranscriptionResponse,
+    CommandAction,
+    CommandRequest,
+    CommandResponse,
+    Intent,
+    Status,
+    VoiceProvider,
+    VoiceProvidersResponse,
+    VoiceSessionConfigRequest,
+    VoiceSessionConfigResponse,
+)
+from app.transcription import transcribe_bytes_with_xai, transcribe_with_xai
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 
 logger = logging.getLogger("javis.command.server")
@@ -39,6 +64,22 @@ def _ensure_runtime_state(app: FastAPI) -> None:
         app.state.seen_events = {}
     if not hasattr(app.state, "seen_lock"):
         app.state.seen_lock = threading.Lock()
+    if not hasattr(app.state, "mode_lock"):
+        app.state.mode_lock = threading.Lock()
+    if not hasattr(app.state, "desired_mode"):
+        app.state.desired_mode = "armed"
+
+
+def _get_desired_mode(app: FastAPI) -> str:
+    _ensure_runtime_state(app)
+    with app.state.mode_lock:
+        return str(app.state.desired_mode)
+
+
+def _set_desired_mode(app: FastAPI, mode: str) -> None:
+    _ensure_runtime_state(app)
+    with app.state.mode_lock:
+        app.state.desired_mode = mode
 
 
 def _is_duplicate_event(app: FastAPI, event_id: UUID) -> bool:
@@ -128,7 +169,10 @@ def commands(payload: CommandRequest, request: Request, _: None = Depends(requir
             start_time_monotonic=app.state.start_time,
             service_name=settings.service_name,
             version=APP_VERSION,
+            desired_mode=_get_desired_mode(app),
         )
+    elif route.intent == Intent.set_mode and route.action_value:
+        _set_desired_mode(app, route.action_value)
 
     response = CommandResponse(
         request_id=request_id,
@@ -149,3 +193,262 @@ def commands(payload: CommandRequest, request: Request, _: None = Depends(requir
         action_value=response.action.value,
     )
     return response
+
+
+@app.get("/v1/voice/providers", response_model=VoiceProvidersResponse)
+def voice_providers(_: None = Depends(require_agent_key)) -> VoiceProvidersResponse:
+    settings = get_settings()
+    default_provider = resolve_voice_provider(settings, None)
+    return VoiceProvidersResponse(default_provider=default_provider, providers=build_provider_catalog(settings))
+
+
+@app.post("/v1/voice/session-config", response_model=VoiceSessionConfigResponse)
+def voice_session_config(
+    payload: VoiceSessionConfigRequest,
+    _: None = Depends(require_agent_key),
+) -> VoiceSessionConfigResponse:
+    settings = get_settings()
+    provider = resolve_voice_provider(settings, payload.provider)
+    return VoiceSessionConfigResponse(
+        provider=provider,
+        websocket_path=f"/v1/voice/realtime?provider={provider.value}",
+        upstream_url=build_realtime_upstream_url(settings, provider),
+        session_update=build_session_update_event(
+            settings,
+            provider,
+            instructions=payload.instructions,
+            voice=payload.voice,
+        ),
+        tools=build_interoperable_tools(),
+    )
+
+
+@app.post("/v1/background/transcriptions", response_model=BackgroundTranscriptionResponse)
+async def background_transcriptions(
+    file: UploadFile = File(...),
+    provider: VoiceProvider = Form(default=VoiceProvider.xai),
+    language: str | None = Form(default=None),
+    diarize: bool = Form(default=True),
+    multichannel: bool = Form(default=False),
+    channels: int | None = Form(default=None),
+    audio_format: str | None = Form(default=None),
+    sample_rate: int | None = Form(default=None),
+    apply_formatting: bool = Form(default=True),
+    _: None = Depends(require_agent_key),
+) -> BackgroundTranscriptionResponse:
+    if provider != VoiceProvider.xai:
+        raise HTTPException(status_code=400, detail="background transcription currently supports only xai")
+
+    settings = get_settings()
+    payload = await transcribe_with_xai(
+        settings=settings,
+        upload=file,
+        language=language,
+        diarize=diarize,
+        multichannel=multichannel,
+        channels=channels,
+        audio_format=audio_format,
+        sample_rate=sample_rate,
+        apply_formatting=apply_formatting,
+    )
+    return BackgroundTranscriptionResponse(
+        provider=provider,
+        text=str(payload.get("text") or ""),
+        duration=payload.get("duration"),
+        language=payload.get("language"),
+        diarized=diarize,
+        words=list(payload.get("words") or []),
+        channels=list(payload.get("channels") or []),
+    )
+
+
+@app.post("/v1/background/transcriptions/raw", response_model=BackgroundTranscriptionResponse)
+async def background_transcriptions_raw(
+    request: Request,
+    provider: VoiceProvider = VoiceProvider.xai,
+    filename: str | None = None,
+    language: str | None = None,
+    diarize: bool = True,
+    multichannel: bool = False,
+    channels: int | None = None,
+    audio_format: str | None = None,
+    sample_rate: int | None = None,
+    apply_formatting: bool = True,
+    _: None = Depends(require_agent_key),
+) -> BackgroundTranscriptionResponse:
+    if provider != VoiceProvider.xai:
+        raise HTTPException(status_code=400, detail="background transcription currently supports only xai")
+
+    file_bytes = await request.body()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="raw audio body is required")
+
+    settings = get_settings()
+    payload = await transcribe_bytes_with_xai(
+        settings=settings,
+        filename=filename or "segment.wav",
+        file_bytes=file_bytes,
+        content_type=request.headers.get("content-type") or "application/octet-stream",
+        language=language,
+        diarize=diarize,
+        multichannel=multichannel,
+        channels=channels,
+        audio_format=audio_format,
+        sample_rate=sample_rate,
+        apply_formatting=apply_formatting,
+    )
+    return BackgroundTranscriptionResponse(
+        provider=provider,
+        text=str(payload.get("text") or ""),
+        duration=payload.get("duration"),
+        language=payload.get("language"),
+        diarized=diarize,
+        words=list(payload.get("words") or []),
+        channels=list(payload.get("channels") or []),
+    )
+
+
+async def _proxy_client_to_upstream(websocket: WebSocket, upstream, provider: VoiceProvider) -> None:
+    settings = get_settings()
+    while True:
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            return
+
+        text = message.get("text")
+        if text is not None:
+            try:
+                event = json.loads(text)
+            except json.JSONDecodeError:
+                await upstream.send(text)
+                continue
+
+            if isinstance(event, dict) and event.get("type") == "session.update":
+                event = build_session_update_event(settings, provider, existing_event=event)
+                await upstream.send(json.dumps(event))
+            else:
+                await upstream.send(text)
+            continue
+
+        data = message.get("bytes")
+        if data is not None:
+            await upstream.send(data)
+
+
+async def _flush_pending_tool_calls(
+    upstream,
+    pending_tool_calls: dict[str, object],
+    *,
+    provider: VoiceProvider,
+    request_id: UUID,
+) -> None:
+    if not pending_tool_calls:
+        return
+
+    settings = get_settings()
+    desired_mode = _get_desired_mode(app)
+
+    for tool_call in pending_tool_calls.values():
+        result = execute_realtime_tool_call(
+            tool_call,
+            service_name=settings.service_name,
+            version=APP_VERSION,
+            start_time_monotonic=app.state.start_time,
+            desired_mode=desired_mode,
+        )
+        if result.requested_mode:
+            _set_desired_mode(app, result.requested_mode)
+            desired_mode = result.requested_mode
+        _log_event(
+            "voice_tool_call",
+            request_id=request_id,
+            provider=provider.value,
+            tool_name=result.name,
+            call_id=result.call_id,
+            ok=result.output.get("ok"),
+        )
+        await upstream.send(json.dumps(build_function_output_event(result)))
+
+    pending_tool_calls.clear()
+    await upstream.send(json.dumps({"type": "response.create"}))
+
+
+async def _proxy_upstream_to_client(websocket: WebSocket, upstream, *, provider: VoiceProvider, request_id: UUID) -> None:
+    pending_tool_calls: dict[str, object] = {}
+    async for message in upstream:
+        if isinstance(message, bytes):
+            await websocket.send_bytes(message)
+        else:
+            flush_after_forward = False
+            try:
+                event = json.loads(message)
+            except json.JSONDecodeError:
+                event = None
+
+            if isinstance(event, dict):
+                for tool_call in extract_realtime_tool_calls(event):
+                    pending_tool_calls.setdefault(tool_call.call_id, tool_call)
+                flush_after_forward = event.get("type") == "response.done" and bool(pending_tool_calls)
+
+            await websocket.send_text(message)
+
+            if flush_after_forward:
+                await _flush_pending_tool_calls(
+                    upstream,
+                    pending_tool_calls,
+                    provider=provider,
+                    request_id=request_id,
+                )
+
+
+@app.websocket("/v1/voice/realtime")
+async def voice_realtime_proxy(websocket: WebSocket) -> None:
+    settings = get_settings()
+    provider_raw = websocket.query_params.get("provider")
+    try:
+        provider = resolve_voice_provider(settings, VoiceProvider(provider_raw) if provider_raw else None)
+        validate_agent_key_value(settings, websocket.headers.get("x-agent-key"))
+        upstream_url = build_realtime_upstream_url(settings, provider)
+        upstream_headers = build_realtime_headers(settings, provider)
+    except Exception:
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    request_id = uuid4()
+    _log_event("voice_realtime_connect", request_id=request_id, provider=provider.value, upstream_url=upstream_url)
+
+    try:
+        async with websockets.connect(
+            upstream_url,
+            additional_headers=upstream_headers,
+            max_size=None,
+            ping_interval=20,
+            ping_timeout=20,
+        ) as upstream:
+            await upstream.send(json.dumps(build_session_update_event(settings, provider)))
+
+            client_task = asyncio.create_task(_proxy_client_to_upstream(websocket, upstream, provider))
+            upstream_task = asyncio.create_task(
+                _proxy_upstream_to_client(websocket, upstream, provider=provider, request_id=request_id)
+            )
+            done, pending = await asyncio.wait({client_task, upstream_task}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            for task in done:
+                exc = task.exception()
+                if exc and not isinstance(exc, WebSocketDisconnect):
+                    raise exc
+    except ConnectionClosed as exc:
+        _log_event("voice_realtime_upstream_closed", request_id=request_id, provider=provider.value, code=exc.code)
+    except WebSocketDisconnect:
+        _log_event("voice_realtime_client_closed", request_id=request_id, provider=provider.value)
+    except Exception as exc:
+        _log_event("voice_realtime_error", request_id=request_id, provider=provider.value, error=str(exc))
+        with suppress(RuntimeError):
+            await websocket.send_text(json.dumps({"type": "error", "error": {"message": str(exc)}}))
+    finally:
+        with suppress(RuntimeError):
+            await websocket.close()

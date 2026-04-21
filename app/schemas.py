@@ -33,6 +33,11 @@ class Intent(str, Enum):
     unknown = "unknown"
 
 
+class VoiceProvider(str, Enum):
+    openai = "openai"
+    xai = "xai"
+
+
 class CommandRequest(BaseModel):
     event_id: UUID
     device_id: str = Field(min_length=1, max_length=64)
@@ -58,3 +63,42 @@ class CommandResponse(BaseModel):
     speak: bool
     action: CommandAction
     server_ts: datetime
+
+
+class VoiceProviderInfo(BaseModel):
+    provider: VoiceProvider
+    enabled: bool
+    websocket_path: str
+    upstream_url: str
+    model: str | None = None
+    turn_detection: str
+    notes: list[str] = Field(default_factory=list)
+
+
+class VoiceProvidersResponse(BaseModel):
+    default_provider: VoiceProvider
+    providers: list[VoiceProviderInfo]
+
+
+class VoiceSessionConfigRequest(BaseModel):
+    provider: VoiceProvider | None = None
+    instructions: str | None = None
+    voice: str | None = None
+
+
+class VoiceSessionConfigResponse(BaseModel):
+    provider: VoiceProvider
+    websocket_path: str
+    upstream_url: str
+    session_update: dict[str, Any]
+    tools: list[dict[str, Any]]
+
+
+class BackgroundTranscriptionResponse(BaseModel):
+    provider: VoiceProvider
+    text: str
+    duration: float | None = None
+    language: str | None = None
+    diarized: bool
+    words: list[dict[str, Any]] = Field(default_factory=list)
+    channels: list[dict[str, Any]] = Field(default_factory=list)
