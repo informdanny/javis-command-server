@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     xai_realtime_url: str = "wss://api.x.ai/v1/realtime"
     xai_stt_url: str = "https://api.x.ai/v1/stt"
     xai_voice: str = "ara"
-    xai_vad_threshold: float = 0.85
+    xai_vad_threshold: float = 0.55
     xai_vad_silence_duration_ms: int = 700
     xai_vad_prefix_padding_ms: int = 333
 
