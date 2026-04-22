@@ -18,6 +18,8 @@ class Settings(BaseSettings):
         "Be helpful, short, and action-oriented. When tools are available, use them instead of guessing."
     )
     realtime_audio_sample_rate: int = 16000
+    voice_memory_ttl_seconds: int = 1800
+    voice_memory_max_events: int = 12
 
     openai_api_key: str | None = None
     openai_realtime_url: str = "wss://api.openai.com/v1/realtime"

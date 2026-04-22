@@ -23,6 +23,8 @@ def reset_runtime_state():
     app.state.seen_lock = threading.Lock()
     app.state.mode_lock = threading.Lock()
     app.state.desired_mode = "armed"
+    app.state.voice_memory_lock = threading.Lock()
+    app.state.voice_memories = {}
     yield
 
 

@@ -129,7 +129,19 @@ def build_session_update_event(
     event["type"] = "session.update"
     session = dict(event.get("session") or {})
 
-    session.setdefault("instructions", instructions or settings.voice_system_prompt)
+    caller_instructions = session.get("instructions")
+    base_instructions = instructions or settings.voice_system_prompt
+    if isinstance(caller_instructions, str) and caller_instructions.strip():
+        if base_instructions.strip():
+            session["instructions"] = (
+                f"{base_instructions.strip()}\n\n"
+                "Additional caller instructions:\n"
+                f"{caller_instructions.strip()}"
+            )
+        else:
+            session["instructions"] = caller_instructions.strip()
+    elif base_instructions.strip():
+        session["instructions"] = base_instructions.strip()
     session["tools"] = _merge_tools(session.get("tools"))
 
     if provider == VoiceProvider.xai:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from contextlib import suppress
@@ -40,6 +41,13 @@ from app.schemas import (
     VoiceSessionConfigResponse,
 )
 from app.transcription import transcribe_bytes_with_xai, transcribe_with_xai
+from app.voice_memory import (
+    VoiceMemoryState,
+    build_memory_aware_instructions,
+    create_voice_memory,
+    remember_realtime_event,
+    reset_if_stale,
+)
 
 APP_VERSION = "0.2.0"
 
@@ -68,6 +76,10 @@ def _ensure_runtime_state(app: FastAPI) -> None:
         app.state.mode_lock = threading.Lock()
     if not hasattr(app.state, "desired_mode"):
         app.state.desired_mode = "armed"
+    if not hasattr(app.state, "voice_memory_lock"):
+        app.state.voice_memory_lock = threading.Lock()
+    if not hasattr(app.state, "voice_memories"):
+        app.state.voice_memories = {}
 
 
 def _get_desired_mode(app: FastAPI) -> str:
@@ -97,6 +109,48 @@ def _is_duplicate_event(app: FastAPI, event_id: UUID) -> bool:
 
         app.state.seen_events[event_id] = now
         return False
+
+
+def _normalize_device_id(raw_device_id: str | None) -> str:
+    text = (raw_device_id or "").strip()
+    if not text:
+        return "default"
+    normalized = re.sub(r"[^a-zA-Z0-9_.-]", "-", text)
+    normalized = normalized[:64].strip("-")
+    return normalized or "default"
+
+
+def _memory_key(provider: VoiceProvider, device_id: str) -> str:
+    return f"{provider.value}:{device_id}"
+
+
+def _get_or_create_voice_memory(app: FastAPI, key: str) -> VoiceMemoryState:
+    _ensure_runtime_state(app)
+    settings = get_settings()
+    with app.state.voice_memory_lock:
+        memory = app.state.voice_memories.get(key)
+        if memory is None:
+            memory = create_voice_memory(settings.voice_memory_max_events)
+            app.state.voice_memories[key] = memory
+        reset_if_stale(memory, settings.voice_memory_ttl_seconds)
+        return memory
+
+
+def _build_voice_instructions(app: FastAPI, key: str) -> str:
+    settings = get_settings()
+    memory = _get_or_create_voice_memory(app, key)
+    with app.state.voice_memory_lock:
+        return build_memory_aware_instructions(settings.voice_system_prompt, memory)
+
+
+def _remember_voice_event(app: FastAPI, key: str, event: dict[str, object]) -> None:
+    _ensure_runtime_state(app)
+    memory = _get_or_create_voice_memory(app, key)
+    with app.state.voice_memory_lock:
+        prior_name = memory.preferred_name
+        remember_realtime_event(memory, event)
+        if memory.preferred_name and memory.preferred_name != prior_name:
+            _log_event("voice_memory_name_set", memory_key=key, preferred_name=memory.preferred_name)
 
 
 _configure_logging()
@@ -308,7 +362,13 @@ async def background_transcriptions_raw(
     )
 
 
-async def _proxy_client_to_upstream(websocket: WebSocket, upstream, provider: VoiceProvider) -> None:
+async def _proxy_client_to_upstream(
+    websocket: WebSocket,
+    upstream,
+    provider: VoiceProvider,
+    *,
+    memory_key: str,
+) -> None:
     settings = get_settings()
     while True:
         message = await websocket.receive()
@@ -324,7 +384,8 @@ async def _proxy_client_to_upstream(websocket: WebSocket, upstream, provider: Vo
                 continue
 
             if isinstance(event, dict) and event.get("type") == "session.update":
-                event = build_session_update_event(settings, provider, existing_event=event)
+                instructions = _build_voice_instructions(app, memory_key)
+                event = build_session_update_event(settings, provider, existing_event=event, instructions=instructions)
                 await upstream.send(json.dumps(event))
             else:
                 await upstream.send(text)
@@ -373,8 +434,17 @@ async def _flush_pending_tool_calls(
     await upstream.send(json.dumps({"type": "response.create"}))
 
 
-async def _proxy_upstream_to_client(websocket: WebSocket, upstream, *, provider: VoiceProvider, request_id: UUID) -> None:
+async def _proxy_upstream_to_client(
+    websocket: WebSocket,
+    upstream,
+    *,
+    provider: VoiceProvider,
+    request_id: UUID,
+    memory_key: str,
+    connected_at_monotonic: float,
+) -> None:
     pending_tool_calls: dict[str, object] = {}
+    first_audio_delta_logged = False
     async for message in upstream:
         if isinstance(message, bytes):
             await websocket.send_bytes(message)
@@ -386,9 +456,20 @@ async def _proxy_upstream_to_client(websocket: WebSocket, upstream, *, provider:
                 event = None
 
             if isinstance(event, dict):
+                _remember_voice_event(app, memory_key, event)
                 for tool_call in extract_realtime_tool_calls(event):
                     pending_tool_calls.setdefault(tool_call.call_id, tool_call)
                 flush_after_forward = event.get("type") == "response.done" and bool(pending_tool_calls)
+                if not first_audio_delta_logged and event.get("type") in {"response.audio.delta", "response.output_audio.delta"}:
+                    first_audio_delta_logged = True
+                    latency_ms = int((time.monotonic() - connected_at_monotonic) * 1000)
+                    _log_event(
+                        "voice_first_audio_delta",
+                        request_id=request_id,
+                        provider=provider.value,
+                        memory_key=memory_key,
+                        ms_since_connect=latency_ms,
+                    )
 
             await websocket.send_text(message)
 
@@ -405,6 +486,7 @@ async def _proxy_upstream_to_client(websocket: WebSocket, upstream, *, provider:
 async def voice_realtime_proxy(websocket: WebSocket) -> None:
     settings = get_settings()
     provider_raw = websocket.query_params.get("provider")
+    device_id = _normalize_device_id(websocket.query_params.get("device_id"))
     try:
         provider = resolve_voice_provider(settings, VoiceProvider(provider_raw) if provider_raw else None)
         validate_agent_key_value(settings, websocket.headers.get("x-agent-key"))
@@ -416,7 +498,15 @@ async def voice_realtime_proxy(websocket: WebSocket) -> None:
 
     await websocket.accept()
     request_id = uuid4()
-    _log_event("voice_realtime_connect", request_id=request_id, provider=provider.value, upstream_url=upstream_url)
+    memory_key = _memory_key(provider, device_id)
+    _log_event(
+        "voice_realtime_connect",
+        request_id=request_id,
+        provider=provider.value,
+        upstream_url=upstream_url,
+        device_id=device_id,
+        memory_key=memory_key,
+    )
 
     try:
         async with websockets.connect(
@@ -426,11 +516,22 @@ async def voice_realtime_proxy(websocket: WebSocket) -> None:
             ping_interval=20,
             ping_timeout=20,
         ) as upstream:
-            await upstream.send(json.dumps(build_session_update_event(settings, provider)))
+            connection_started_at = time.monotonic()
+            instructions = _build_voice_instructions(app, memory_key)
+            await upstream.send(json.dumps(build_session_update_event(settings, provider, instructions=instructions)))
 
-            client_task = asyncio.create_task(_proxy_client_to_upstream(websocket, upstream, provider))
+            client_task = asyncio.create_task(
+                _proxy_client_to_upstream(websocket, upstream, provider, memory_key=memory_key)
+            )
             upstream_task = asyncio.create_task(
-                _proxy_upstream_to_client(websocket, upstream, provider=provider, request_id=request_id)
+                _proxy_upstream_to_client(
+                    websocket,
+                    upstream,
+                    provider=provider,
+                    request_id=request_id,
+                    memory_key=memory_key,
+                    connected_at_monotonic=connection_started_at,
+                )
             )
             done, pending = await asyncio.wait({client_task, upstream_task}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:

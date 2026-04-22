@@ -26,6 +26,11 @@ Set at least:
 - `XAI_API_KEY` for background transcription and xAI realtime A/B
 - `OPENAI_API_KEY` for OpenAI realtime A/B
 
+Optional tuning:
+
+- `VOICE_MEMORY_TTL_SECONDS` (default `1800`)
+- `VOICE_MEMORY_MAX_EVENTS` (default `12`)
+
 ## Run Locally
 
 ```bash
@@ -122,6 +127,8 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
 - The server reads `.env` automatically through `pydantic-settings`.
 - `tools/device_simulator.py` and `tools/local_test_harness.py` fall back to `.env` when `AGENT_API_KEY` is not already exported.
 - The realtime WebSocket relay is server-to-server and is intended to sit behind the ESP32 client or a local bridge.
+- The relay accepts an optional `device_id` query param on `WS /v1/voice/realtime` and uses it to scope short-term conversation memory.
+- Conversation continuity is in-memory only (process-local): it survives wake/session reconnects but resets on server restart or TTL expiry.
 - Background transcription currently supports only `xai` in the implemented API.
 - `POST /v1/background/transcriptions/raw` exists specifically to keep the ESP32 upload path simple by accepting a raw audio body instead of multipart form data.
 - When `apply_formatting=true` and no `language` is supplied, the server currently falls back to `en` for xAI STT compatibility.
