@@ -61,7 +61,7 @@ Important limitation:
 
 - `set_agent_mode` updates the server-side `desired_mode` state and works for A/B tool-calling tests.
 - It does not yet push that mode change down to the ESP32 firmware. Device transport is the next integration slice.
-- `search_web` uses DuckDuckGo Instant Answer as a lightweight, no-extra-key web lane for realtime tool calls.
+- `search_web` uses DuckDuckGo (Instant Answer + HTML fallback parsing) as a lightweight, no-extra-key web lane for realtime tool calls.
 
 ## Quick Tests
 
