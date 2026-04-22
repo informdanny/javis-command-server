@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import html
+import re
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, urlparse, unquote
 
 import httpx
 
 DUCKDUCKGO_INSTANT_ANSWER_URL = "https://api.duckduckgo.com/"
+DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/"
 
 
 def search_web(*, query: str, max_results: int = 3, timeout_seconds: float = 8.0) -> dict[str, Any]:
@@ -44,14 +47,32 @@ def search_web(*, query: str, max_results: int = 3, timeout_seconds: float = 8.0
             "results": [],
         }
 
-    results = _collect_results(payload, max_results=bounded_results)
+    instant_results = _collect_results(payload, max_results=bounded_results)
+    results = list(instant_results)
+    if len(results) < bounded_results:
+        html_results = _search_duckduckgo_html(
+            query=query_text,
+            max_results=bounded_results,
+            timeout_seconds=timeout_seconds,
+        )
+        for result in html_results:
+            if len(results) >= bounded_results:
+                break
+            if any(existing["url"] == result["url"] for existing in results):
+                continue
+            results.append(result)
+
     abstract_text = _safe_text(payload.get("AbstractText"))
     abstract_url = _safe_text(payload.get("AbstractURL"))
+
+    provider_name = "duckduckgo_instant"
+    if len(results) > len(instant_results):
+        provider_name = "duckduckgo_instant+html"
 
     output: dict[str, Any] = {
         "ok": True,
         "query": query_text,
-        "provider": "duckduckgo_instant",
+        "provider": provider_name,
         "result_count": len(results),
         "results": results,
         "search_url": f"https://duckduckgo.com/?q={quote_plus(query_text)}",
@@ -116,6 +137,58 @@ def _collect_results(payload: Any, *, max_results: int) -> list[dict[str, str]]:
     return results[:max_results]
 
 
+def _search_duckduckgo_html(*, query: str, max_results: int, timeout_seconds: float) -> list[dict[str, str]]:
+    try:
+        response = httpx.get(
+            DUCKDUCKGO_HTML_SEARCH_URL,
+            params={"q": query},
+            headers={"User-Agent": "javis-command-server/0.2"},
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+    except Exception:  # pragma: no cover - covered indirectly via tool output fallback behavior
+        return []
+
+    html_body = response.text
+    link_matches = list(
+        re.finditer(
+            r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            html_body,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    )
+    snippet_matches = [
+        _clean_text(match.group(1))
+        for match in re.finditer(
+            r'<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>|<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</div>',
+            html_body,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    ]
+
+    results: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for index, link_match in enumerate(link_matches):
+        if len(results) >= max_results:
+            break
+        raw_url = _safe_text(link_match.group(1))
+        normalized_url = _normalize_result_url(raw_url)
+        if not normalized_url or normalized_url in seen_urls:
+            continue
+        seen_urls.add(normalized_url)
+        title = _clean_text(link_match.group(2)) or normalized_url
+        snippet = snippet_matches[index] if index < len(snippet_matches) else ""
+        results.append(
+            {
+                "title": title[:180],
+                "url": normalized_url,
+                "snippet": snippet[:500],
+            }
+        )
+
+    return results
+
+
 def _title_from_text(text: str) -> str:
     value = text.strip()
     if not value:
@@ -130,3 +203,26 @@ def _title_from_text(text: str) -> str:
 
 def _safe_text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def _clean_text(value: str) -> str:
+    stripped = re.sub(r"<[^>]+>", " ", value)
+    unescaped = html.unescape(stripped)
+    return re.sub(r"\s+", " ", unescaped).strip()
+
+
+def _normalize_result_url(url: str) -> str:
+    value = _safe_text(url)
+    if not value:
+        return ""
+    if value.startswith("//"):
+        value = f"https:{value}"
+    if value.startswith("/"):
+        value = f"https://duckduckgo.com{value}"
+
+    parsed = urlparse(value)
+    query = parse_qs(parsed.query)
+    redirect_target = query.get("uddg")
+    if redirect_target and redirect_target[0]:
+        return unquote(redirect_target[0])
+    return value
