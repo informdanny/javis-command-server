@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     realtime_audio_sample_rate: int = 16000
     voice_memory_ttl_seconds: int = 1800
     voice_memory_max_events: int = 12
+    web_search_timeout_seconds: float = 8.0
+    web_search_max_results: int = 3
 
     openai_api_key: str | None = None
     openai_realtime_url: str = "wss://api.openai.com/v1/realtime"

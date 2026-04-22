@@ -105,6 +105,7 @@ def test_voice_session_config_injects_tools():
     tool_names = {tool["name"] for tool in body["tools"]}
     assert "get_agent_status" in tool_names
     assert "set_agent_mode" in tool_names
+    assert "search_web" in tool_names
     assert body["session_update"]["type"] == "session.update"
 
 

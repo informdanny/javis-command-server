@@ -30,6 +30,8 @@ Optional tuning:
 
 - `VOICE_MEMORY_TTL_SECONDS` (default `1800`)
 - `VOICE_MEMORY_MAX_EVENTS` (default `12`)
+- `WEB_SEARCH_TIMEOUT_SECONDS` (default `8.0`)
+- `WEB_SEARCH_MAX_RESULTS` (default `3`)
 
 ## Run Locally
 
@@ -49,15 +51,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - `POST /v1/background/transcriptions`
 - `POST /v1/background/transcriptions/raw`
 
-Two shared realtime tools are injected into both providers today:
+Three shared realtime tools are injected into both providers today:
 
 - `get_agent_status`
 - `set_agent_mode`
+- `search_web`
 
 Important limitation:
 
 - `set_agent_mode` updates the server-side `desired_mode` state and works for A/B tool-calling tests.
 - It does not yet push that mode change down to the ESP32 firmware. Device transport is the next integration slice.
+- `search_web` uses DuckDuckGo Instant Answer as a lightweight, no-extra-key web lane for realtime tool calls.
 
 ## Quick Tests
 

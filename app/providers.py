@@ -38,6 +38,28 @@ def build_interoperable_tools() -> list[dict]:
                 "additionalProperties": False,
             },
         },
+        {
+            "type": "function",
+            "name": "search_web",
+            "description": "Search the web for fresh information and return concise source links.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query text.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
+                        "description": "Maximum number of results to return (default 3).",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
     ]
 
 

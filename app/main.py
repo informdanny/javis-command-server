@@ -416,6 +416,8 @@ async def _flush_pending_tool_calls(
             version=APP_VERSION,
             start_time_monotonic=app.state.start_time,
             desired_mode=desired_mode,
+            web_search_timeout_seconds=settings.web_search_timeout_seconds,
+            web_search_max_results=settings.web_search_max_results,
         )
         if result.requested_mode:
             _set_desired_mode(app, result.requested_mode)

@@ -6,6 +6,7 @@ from typing import Any
 
 from app.handlers import build_status_reply
 from app.router import route_command
+from app.web_search import search_web
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,8 @@ def execute_realtime_tool_call(
     version: str,
     start_time_monotonic: float,
     desired_mode: str,
+    web_search_timeout_seconds: float = 8.0,
+    web_search_max_results: int = 3,
 ) -> RealtimeToolResult:
     if tool_call.name == "get_agent_status":
         reply_text = build_status_reply(
@@ -105,6 +108,40 @@ def execute_realtime_tool_call(
                 "device_sync": "pending",
                 "note": "Server desired mode updated; ESP32 mode sync is not wired yet.",
             },
+        )
+
+    if tool_call.name == "search_web":
+        query = tool_call.arguments.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return RealtimeToolResult(
+                call_id=tool_call.call_id,
+                name=tool_call.name,
+                output={
+                    "ok": False,
+                    "error": "query must be a non-empty string",
+                    "desired_mode": desired_mode,
+                },
+            )
+
+        max_results = web_search_max_results
+        raw_max_results = tool_call.arguments.get("max_results")
+        if isinstance(raw_max_results, (int, float, str)):
+            try:
+                max_results = int(raw_max_results)
+            except (TypeError, ValueError):
+                max_results = web_search_max_results
+        max_results = max(1, min(max_results, 8))
+
+        output = search_web(
+            query=query,
+            max_results=max_results,
+            timeout_seconds=web_search_timeout_seconds,
+        )
+        output["desired_mode"] = desired_mode
+        return RealtimeToolResult(
+            call_id=tool_call.call_id,
+            name=tool_call.name,
+            output=output,
         )
 
     return RealtimeToolResult(
